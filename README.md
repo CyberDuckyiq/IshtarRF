@@ -195,5 +195,5 @@ _`images/Screenshot-ubuntu.png`._
 
 Copyright (c) 2025 Cyber Ducky.
 
-This project (desktop app and ESP32 firmware) is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0-only)**.  
+This project IshtarRF(desktop app and ESP32 firmware) is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0-only)**.  
 See the full text in [`LICENSE`](LICENSE).
