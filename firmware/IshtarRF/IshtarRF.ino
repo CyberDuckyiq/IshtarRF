@@ -27,6 +27,16 @@
 #ifndef CC1101_SFTX
   #define CC1101_SFTX   0x3B
 #endif
+#ifndef CC1101_MARCSTATE
+  #define CC1101_MARCSTATE 0x35   // main radio control state machine status
+#endif
+
+// MARCSTATE values we care about
+#define MARC_IDLE            0x01
+#define MARC_RX              0x0D
+#define MARC_TX              0x13
+#define MARC_RXFIFO_OVERFLOW 0x11
+#define MARC_TXFIFO_UNDERFLOW 0x16
 
 //Serial
 #define SERIAL_BAUD 115200
@@ -105,7 +115,32 @@ static bool applyRadioConfig(){
   return true;
 }
 
+// --- Radio state helpers (v0.2.0) ---------------------------------------
+// The CC1101 can wedge in a FIFO-fault or calibration state after an RX/TX
+// cycle. These helpers read MARCSTATE and clear faults so RX/TX keep working
+// across repeated cycles instead of dying after the first one.
+static uint8_t marcState(){
+  return ELECHOUSE_cc1101.SpiReadStatus(CC1101_MARCSTATE) & 0x1F;
+}
+static bool waitMarcState(uint8_t target, uint16_t tries){
+  for(uint16_t i=0;i<tries;i++){
+    if(marcState() == target) return true;
+    delayMicroseconds(50);
+  }
+  return false;
+}
+static void clearRadioFaults(){
+  uint8_t ms = marcState();
+  if(ms == MARC_RXFIFO_OVERFLOW || ms == MARC_TXFIFO_UNDERFLOW){
+    ELECHOUSE_cc1101.SpiStrobe(CC1101_SIDLE);
+    ELECHOUSE_cc1101.SpiStrobe(CC1101_SFRX);
+    ELECHOUSE_cc1101.SpiStrobe(CC1101_SFTX);
+  }
+}
+
 static void enterAsyncRx(){
+  ELECHOUSE_cc1101.SpiStrobe(CC1101_SIDLE);   // clean transition into RX
+  clearRadioFaults();
   ELECHOUSE_cc1101.setPktFormat(3);
   uint8_t v = ELECHOUSE_cc1101.SpiReadReg(CC1101_IOCFG0);
   v &= 0xC0; v |= 0x0D;
@@ -113,6 +148,12 @@ static void enterAsyncRx(){
   ELECHOUSE_cc1101.SpiStrobe(CC1101_SFRX);
   ELECHOUSE_cc1101.SetRx();
   pinMode(PIN_GDO0, INPUT);
+  // Confirm the radio really reached RX; if it didn't, clear faults and retry.
+  if(!waitMarcState(MARC_RX, 100)){
+    clearRadioFaults();
+    ELECHOUSE_cc1101.SetRx();
+    waitMarcState(MARC_RX, 100);
+  }
 }
 
 static void enterPacketRx(){
@@ -157,6 +198,8 @@ static bool txBytes(const String& hex){
 
 //OOK RAW TX
 static bool txRawDirect(const uint32_t* pulses, int count, int repeat, int gap_ms, bool invert){
+  ELECHOUSE_cc1101.SpiStrobe(CC1101_SIDLE);   // clean state before TX
+  clearRadioFaults();
   ELECHOUSE_cc1101.setPktFormat(3);
   uint8_t v = ELECHOUSE_cc1101.SpiReadReg(CC1101_IOCFG0);
   v &= 0xC0; v |= 0x2E;                       // 0x2E = 3-state
@@ -164,20 +207,34 @@ static bool txRawDirect(const uint32_t* pulses, int count, int repeat, int gap_m
 
   ELECHOUSE_cc1101.SpiStrobe(CC1101_SFTX);
   ELECHOUSE_cc1101.SetTx();
+  // Confirm the radio actually entered TX; if not, recover and report failure
+  // instead of silently "succeeding" while nothing is on the air.
+  if(!waitMarcState(MARC_TX, 100)){
+    clearRadioFaults();
+    ELECHOUSE_cc1101.SetTx();
+    if(!waitMarcState(MARC_TX, 100)){
+      ELECHOUSE_cc1101.SpiStrobe(CC1101_SIDLE);
+      pinMode(PIN_GDO0, INPUT);
+      return false;
+    }
+  }
 
   pinMode(PIN_GDO0, OUTPUT);
   bool level = invert ? HIGH : LOW;
   digitalWrite(PIN_GDO0, level);
   delayMicroseconds(400);
 
-  bool ok = true;
-  for(int r=0;r<repeat && ok;r++){
+  for(int r=0;r<repeat;r++){
     for(int i=0;i<count;i++){
       level = !level;
       digitalWrite(PIN_GDO0, level);
       uint32_t us = pulses[i]; if(us < 2) us = 2;
       while(us > 16000){ delayMicroseconds(16000); us -= 16000; yield(); }
       delayMicroseconds(us);
+      // Feed the task watchdog on very long pulse trains. Yielding once every
+      // 128 edges keeps a huge replay from resetting the ESP32 (which on USB
+      // would drop the link) while adding only negligible timing jitter.
+      if((i & 0x7F) == 0x7F) yield();
     }
     digitalWrite(PIN_GDO0, invert ? HIGH : LOW);
 
@@ -189,7 +246,7 @@ static bool txRawDirect(const uint32_t* pulses, int count, int repeat, int gap_m
   ELECHOUSE_cc1101.SpiStrobe(CC1101_SIDLE);
   ELECHOUSE_cc1101.SpiStrobe(CC1101_SFTX);
   pinMode(PIN_GDO0, INPUT);
-  return ok;
+  return true;
 }
 
 //RSSI
@@ -323,12 +380,22 @@ void loop(){
     }
     else if(cmd=="tx_bytes"){
       String hex = valS(line,"hex","");
-      if(txBytes(hex)) sendOK("tx_bytes"); else sendERR("tx_bytes failed");
+      if(rxMode == RX_RAW) rawStop();
+      bool ok = txBytes(hex);
+      // Restore the previous RX mode so the radio keeps listening after a TX.
+      if(rxMode == RX_RAW){ enterAsyncRx(); rawStart(); }
+      else if(rxMode == RX_PACKET){ enterPacketRx(); }
+      if(ok) sendOK("tx_bytes"); else sendERR("tx_bytes failed");
     }
     else if(cmd=="tx_raw"){
       int b = line.indexOf('['), e = line.indexOf(']', b+1);
       if(b<0 || e<0){ sendERR("tx_raw bad pulses"); }
       else{
+        // Stop capture BEFORE parsing: the RX ISR and tx parsing share the
+        // raw_pulses[] buffer, so an incoming edge mid-parse would corrupt the
+        // outgoing frame. Detaching the interrupt first removes that race.
+        if(rxMode == RX_RAW) rawStop();
+
         String arr = line.substring(b+1, e);
         int cnt=0, start=0;
         while(start < arr.length() && cnt < RAW_MAX_PULSES){
@@ -342,7 +409,6 @@ void loop(){
         String invS = valS(line,"invert","false");
         bool invert = (invS=="true" || invS=="1");
 
-        if(rxMode == RX_RAW) rawStop();
         bool ok = (cnt>0) && txRawDirect((const uint32_t*)raw_pulses, cnt, rep, gap, invert);
 
         if(rxMode == RX_RAW){ enterAsyncRx(); rawStart(); }
